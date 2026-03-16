@@ -4,3 +4,9 @@ main/checkpoints/distillation/student_step_3000.pt
 main/checkpoints/distillation/student_step_4000.pt
 main/dummy_ckpt.pt
 mamba/selective_scan_cuda.cpython-311-x86_64-linux-gnu.so
+main/checkpoints/distillation/student_step_1000.pt
+main/checkpoints/distillation/student_step_2000.pt
+main/checkpoints/distillation/student_step_3000.pt
+main/checkpoints/distillation/student_step_4000.pt
+main/dummy_ckpt.pt
+mamba/selective_scan_cuda.cpython-311-x86_64-linux-gnu.so
