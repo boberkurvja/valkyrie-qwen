@@ -8,12 +8,6 @@ following the HRM paper exactly:
   - Loss computed ONLY on output grid positions (labels=-100 on input)
   - 1-step gradient with state detachment between segments → O(1) memory
   - Adam-atan2 optimizer (scale-invariant, bounds weights via L∞ constraint)
-
-The paper mandates:
-  z^m = HRM(z^(m-1), x; θ)      # forward pass
-  loss = Loss(ŷ^m, y)           # supervise at EVERY segment
-  θ ← optimizer(∇_θ loss)       # update after EACH segment
-  z^m = detach(z^m)             # cut graph for O(1) memory
 """
 import os
 import sys
@@ -26,6 +20,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+# Multi-GPU imports
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+
 from config import get_config, ValkyrieConfig
 from valkyrie_hrm import ValkyrieHRM
 
@@ -37,97 +35,70 @@ except ImportError:
     print("Warning: adam-atan2-pytorch not installed, falling back to AdamW")
     AdamATan2 = None
 
-# ── HRM losses / layers ──────────────────────────────────────────────────────
 from models.losses import stablemax_cross_entropy, IGNORE_LABEL_ID
 from models.layers import CastedLinear, CastedEmbedding
 
-# ── ARC Grid constants (must match build_arc_dataset.py) ─────────────────────
-#   token 0  = PAD
-#   token 1  = EOS
-#   tokens 2-11 = digits 0-9
-ARC_VOCAB_SIZE = 12    # 12 tokens: PAD, EOS, 0-9
-ARC_GRID_SIZE  = 30    # max 30×30 grids  → seq_len = 900
-ARC_SEQ_LEN    = ARC_GRID_SIZE * ARC_GRID_SIZE  # 900
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Lightweight ARC Dataset  (raw .json files from fchollet/ARC-AGI)
+#  FineWeb Autoregressive Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 import json, random
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from routing import REASON_TOKEN
 
-class ARCDataset(Dataset):
+class FineWebDataset(Dataset):
     """
-    Loads ARC-AGI raw JSON puzzles and converts them to flat grid token sequences.
-    Input  tokens: input-grid  → [0-11] in row-major order, padded to 900
-    Output tokens: output-grid → [0-11] in row-major order, padded to 900
-    Labels: -100 everywhere EXCEPT output grid positions (seq2seq masking).
+    Loads general text data (e.g., FineWeb) and formats it for causal language modeling.
+    Periodically injects the <|reason|> token to activate the HRM coprocessor.
     """
-
-    def __init__(self, data_dir: str, split: str = "train", max_examples: Optional[int] = None):
+    def __init__(self, data_dir: str, tokenizer: AutoTokenizer, seq_len: int = 2048, max_examples: Optional[int] = None):
         self.examples = []
-        self._load(data_dir, split, max_examples)
+        self.seq_len = seq_len
+        self.tokenizer = tokenizer
+        
+        # Ensure the reason token is in the tokenizer
+        if REASON_TOKEN not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [REASON_TOKEN]})
+            
+        self.reason_token_id = self.tokenizer.convert_tokens_to_ids(REASON_TOKEN)
+        self._load(data_dir, max_examples)
 
-    @staticmethod
-    def _grid_to_seq(grid) -> np.ndarray:
-        """Flatten 2D grid to 1D token array, encoding digit d as (d+2)."""
-        rows = []
-        for row in grid:
-            for v in row:
-                rows.append(int(v) + 2)              # digit d→token d+2
-        arr = np.array(rows, dtype=np.int32)
-        # Pad to ARC_SEQ_LEN with 0 (PAD)
-        if len(arr) < ARC_SEQ_LEN:
-            arr = np.concatenate([arr, np.zeros(ARC_SEQ_LEN - len(arr), dtype=np.int32)])
-        else:
-            arr = arr[:ARC_SEQ_LEN]
-        return arr
-
-    def _load(self, data_dir: str, split: str, max_examples: Optional[int]):
-        if not os.path.isdir(data_dir):
-            raise FileNotFoundError(f"ARC data directory not found: {data_dir}")
-
-        puzzle_files = sorted(
-            os.path.join(data_dir, f)
-            for f in os.listdir(data_dir)
-            if f.endswith(".json")
-        )
-
-        rng = random.Random(42)
-        rng.shuffle(puzzle_files)
-
-        for fpath in puzzle_files:
+    def _load(self, data_dir: str, max_examples: Optional[int]):
+        from datasets import load_dataset
+        
+        dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+        
+        for i, row in enumerate(dataset):
             if max_examples and len(self.examples) >= max_examples:
                 break
-            try:
-                puzzle = json.load(open(fpath))
-            except Exception:
-                continue
+                
+            text = row["text"]
+            
+            # Tokenize text
+            tokens = self.tokenizer(text, truncation=True, max_length=self.seq_len, return_tensors="pt")["input_ids"].squeeze(0)
+            
+            # Inject <|reason|> token randomly to train the router/HRM path
+            if len(tokens) > 10 and random.random() > 0.5:
+                insert_idx = random.randint(5, len(tokens) - 5)
+                tokens = torch.cat([
+                    tokens[:insert_idx], 
+                    torch.tensor([self.reason_token_id]), 
+                    tokens[insert_idx:]
+                ])[:self.seq_len]
 
-            pairs = puzzle.get(split, puzzle.get("train", []))
-            for pair in pairs:
-                if max_examples and len(self.examples) >= max_examples:
-                    break
-                inp  = pair.get("input", [])
-                out  = pair.get("output", [])
-                if not inp or not out:
-                    continue
+            # Pad sequence if necessary
+            if len(tokens) < self.seq_len:
+                pad_len = self.seq_len - len(tokens)
+                tokens = torch.cat([tokens, torch.full((pad_len,), self.tokenizer.pad_token_id)])
 
-                inp_seq = self._grid_to_seq(inp)
-                out_seq = self._grid_to_seq(out)
+            # For Causal LM, labels are exactly the input_ids. 
+            labels = tokens.clone()
+            labels[labels == self.tokenizer.pad_token_id] = -100 # Ignore padding in loss
 
-                # labels: -100 on input tokens, real tokens on output tokens
-                # HRM takes [inputs] and predicts [labels] at same positions.
-                labels = out_seq.copy()
-                # Replace PAD positions in output with ignore
-                labels[labels == 0] = IGNORE_LABEL_ID
-
-                self.examples.append({
-                    "inputs": torch.tensor(inp_seq, dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                })
-
-        print(f"  Loaded {len(self.examples)} {split} examples")
+            self.examples.append({
+                "inputs": tokens.to(torch.long),
+                "labels": labels.to(torch.long),
+            })
 
     def __len__(self):
         return len(self.examples)
@@ -137,76 +108,63 @@ class ARCDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HRM Seq2Seq Trainer
+#  HRM Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 class HRMTrainer:
-    """
-    Deep Supervision trainer for the HRM coprocessor — paper-accurate.
-
-    Key principles (from Section 2 of the HRM paper):
-    1. Freeze Valkyrie backbone; train only HRM inner + bridge.
-    2. Each training step = one deep-supervision SEGMENT:
-         z^m, ŷ^m  = HRM_inner(z^(m-1), x)
-         loss       = Loss(ŷ^m, y)
-         optimizer.step()
-         z^m        = z^m.detach()     ← O(1) memory
-    3. The HRM uses its OWN embedding + LM head (ARC vocab=12), NOT Qwen.
-    4. Non-autoregressive (no token shift), loss averaged over output tokens.
-    5. Adam-atan2 keeps weights bounded (L∞ constraint → Q-learning stability).
-    """
-
-    def __init__(self, config: ValkyrieConfig, model: ValkyrieHRM, device: str = "cuda"):
+    def __init__(self, config: ValkyrieConfig, model: ValkyrieHRM, device: str = "cuda", is_ddp: bool = False, local_rank: int = 0):
         self.config     = config
         self.model      = model
         self.device     = device
+        self.is_ddp     = is_ddp
+        self.local_rank = local_rank
         self.hrm_config = config.hrm_train
 
-        # Freeze backbone, only train HRM + bridge
+        # 1. Freeze everything by default
         self.model.freeze_backbone()
 
-        # ── Bug 1 fix: replace lm_head and embed_tokens with ARC-vocab sizes ──
-        # ValkyrieHRM._create_hrm_inner() uses the Qwen vocab_size (248,320),
-        # but we only need ARC_VOCAB_SIZE=12 here.  The large random lm_head
-        # causes float32 overflow in stablemax (248K terms) → NaN immediately.
-        hrm_inner = self.model.hrm_inner
-        arc_dim = hrm_inner.config.hidden_size
-        hrm_inner.embed_tokens = CastedEmbedding(
-            ARC_VOCAB_SIZE, arc_dim,
-            init_std=1.0 / hrm_inner.embed_scale,
-            cast_to=hrm_inner.forward_dtype,
-        ).to(device)
-        hrm_inner.lm_head = CastedLinear(arc_dim, ARC_VOCAB_SIZE, bias=False).to(device)
-        print(f"  HRM lm_head replaced: {arc_dim} → {ARC_VOCAB_SIZE} (ARC vocab)")
+        # 2. Extract strictly necessary parameters using Python id() to prevent PyTorch broadcasting crashes
+        self.trainable_params = []
+        
+        # Get the memory IDs of the parameters designated for training (Bridge + HRM)
+        hrm_param_ids = {id(p) for p in self.model.get_hrm_parameters()}
 
-        # Rebuild param list AFTER replacing the modules so the new weights are included
-        hrm_params = self.model.get_hrm_parameters()
-        for p in hrm_params:
-            p.requires_grad_(True)
+        for name, p in self.model.named_parameters():
+            if id(p) in hrm_param_ids:
+                # Filter out the unused giant token layers
+                if "hrm_inner.lm_head" in name or "hrm_inner.embed_tokens" in name:
+                    p.requires_grad_(False)
+                else:
+                    p.requires_grad_(True)
+                    self.trainable_params.append(p)
+            else:
+                p.requires_grad_(False)
 
-        trainable = sum(p.numel() for p in hrm_params if p.requires_grad)
-        print(f"  Trainable parameters (HRM + Bridge): {trainable / 1e6:.2f}M")
-
-        # Optimizer
+        trainable = sum(p.numel() for p in self.trainable_params)
+        
+        # 3. Optimizer
         if AdamATan2 is not None:
             self.optimizer = AdamATan2(
-                hrm_params,
+                self.trainable_params,
                 lr=self.hrm_config.learning_rate,
                 weight_decay=self.hrm_config.weight_decay,
                 betas=(self.hrm_config.beta1, self.hrm_config.beta2),
             )
-            print("  Optimizer: Adam-atan2")
+            optim_str = "Adam-atan2"
         else:
             self.optimizer = torch.optim.AdamW(
-                hrm_params,
+                self.trainable_params,
                 lr=self.hrm_config.learning_rate,
                 weight_decay=self.hrm_config.weight_decay,
                 betas=(self.hrm_config.beta1, self.hrm_config.beta2),
             )
-            print("  Optimizer: AdamW (fallback)")
+            optim_str = "AdamW (fallback)"
+
+        if self.local_rank == 0:
+            print(f"  Trainable parameters (HRM + Bridge): {trainable / 1e6:.2f}M")
+            print(f"  Optimizer: {optim_str}")
 
         self.global_step = 0
 
-    # ── LR schedule: linear warmup then constant ──────────────────────────────
     def _update_lr(self) -> float:
         warmup = self.hrm_config.warmup_steps
         step   = self.global_step
@@ -215,220 +173,149 @@ class HRMTrainer:
             g["lr"] = lr
         return lr
 
-    # ── One segment forward + backward ───────────────────────────────────────
-    def _segment_step(
-        self,
-        hrm,
-        inp_seq: torch.Tensor,    # [B, L]  ARC grid tokens (0-11)
-        labels:  torch.Tensor,    # [B, L]  target tokens or -100
-        z_H:     Optional[torch.Tensor],
-        z_L:     Optional[torch.Tensor],
-    ) -> Dict:
-        """
-        One deep-supervision segment following the paper pseudocode.
-
-        Forward path (paper Figure 4):
-          x̃ = embed_scale * embed_tokens(input)
-          [no-grad] all H×L cycles except the very last step of each module
-          [grad]    last L-step: z_L = L_level(z_L, z_H + x̃)
-          [grad]    last H-step: z_H = H_level(z_H, z_L)
-          ŷ  = lm_head(z_H)            ← full-sequence, non-causal
-          loss = mean(stablemax_CE(ŷ, y))   only where labels != -100
-        """
-        B, L = inp_seq.shape
-        hrm_inner = hrm  # model.hrm_inner
-
-        # Rotary positional encoding (pre-computed, cos_sin)
-        seq_info = dict(
-            cos_sin=hrm_inner.rotary_emb() if hasattr(hrm_inner, "rotary_emb") else None,
-        )
-
-        # ── Bug 3 fix: compute embedding OUTSIDE no_grad so embed_tokens gets grads ──
-        # The paper's 1-step gradient approximation only stops grads through the
-        # recurrent carry (z_H / z_L), NOT through the input embedding.  We pass a
-        # detached copy into the convergence loop and the live tensor to the 1-step.
-        x_emb = hrm_inner.embed_scale * hrm_inner.embed_tokens(
-            inp_seq.to(torch.int32)
-        )  # [B, L, H]  — full gradient kept
-        x_emb_sg = x_emb.detach()  # stop-gradient copy for convergence loop
-
-        # Initialise states if first segment
-        dtype = hrm_inner.forward_dtype
-        if z_H is None:
-            z_H = hrm_inner.H_init.unsqueeze(0).unsqueeze(0).expand(B, L, -1).clone().to(dtype)
-            z_L = hrm_inner.L_init.unsqueeze(0).unsqueeze(0).expand(B, L, -1).clone().to(dtype)
-
-        H_cycles = hrm_inner.config.H_cycles
-        L_cycles = hrm_inner.config.L_cycles
-
-        # ── No-grad convergence iterations (carry convergence only) ───────────
-        with torch.no_grad():
-            for h in range(H_cycles):
-                for l in range(L_cycles):
-                    if not (h == H_cycles - 1 and l == L_cycles - 1):
-                        z_L = hrm_inner.L_level(z_L, z_H + x_emb_sg, **seq_info)
-                if h < H_cycles - 1:
-                    z_H = hrm_inner.H_level(z_H, z_L, **seq_info)
-
-        # ── 1-step gradient (last iteration — full grad through x_emb) ────────
-        z_L = hrm_inner.L_level(z_L, z_H + x_emb, **seq_info)
-        z_H = hrm_inner.H_level(z_H, z_L, **seq_info)
-
-        # ── Outputs ──────────────────────────────────────────────────────────
-        # lm_head maps H → ARC_VOCAB_SIZE (12) — NOT Qwen's 150K vocab
-        logits = hrm_inner.lm_head(z_H).to(torch.float32)   # [B, L, 12]
-        q_logits = hrm_inner.q_head(z_H[:, 0]).to(torch.float32)  # [B, 2]
-
-        # ── Loss: seq2seq, NO token shifting (non-autoregressive) ───────────
-        lm_loss = stablemax_cross_entropy(
-            logits.view(-1, logits.shape[-1]),   # [B*L, 12]
-            labels.view(-1),                      # [B*L]
-            ignore_index=IGNORE_LABEL_ID,
-        )
-        # average only over non-masked positions
-        valid_mask = labels.view(-1) != IGNORE_LABEL_ID
-        num_valid  = valid_mask.sum().clamp(min=1)
-        lm_loss    = lm_loss.sum() / num_valid
-
-        # ── Q-head loss (ACT) ──────────────────────────────────────────────
-        with torch.no_grad():
-            mask        = labels != IGNORE_LABEL_ID
-            is_correct  = mask & (torch.argmax(logits, dim=-1) == labels)
-            loss_counts = mask.sum(-1)
-            seq_correct = is_correct.sum(-1) == loss_counts
-
-        q_halt_loss = F.binary_cross_entropy_with_logits(
-            q_logits[:, 0],
-            seq_correct.float(),
-            reduction="mean",
-        )
-
-        total_loss = lm_loss + 0.5 * q_halt_loss
-
-        # Detach states for next segment — this is the O(1) memory trick
-        new_z_H = z_H.detach()
-        new_z_L = z_L.detach()
-
-        with torch.no_grad():
-            accuracy    = is_correct.float().mean()
-            exact_acc   = seq_correct.float().mean()
-
-        return {
-            "loss":           total_loss,
-            "lm_loss":        lm_loss.detach(),
-            "q_halt_loss":    q_halt_loss.detach(),
-            "accuracy":       accuracy,
-            "exact_accuracy": exact_acc,
-            "z_H":            new_z_H,
-            "z_L":            new_z_L,
-            "q_halt":         q_logits[:, 0].detach(),
-            "q_continue":     q_logits[:, 1].detach(),
-        }
-
-    # ── Training loop ─────────────────────────────────────────────────────────
-    def train(self):
+    def train(self, tokenizer):
         cfg = self.hrm_config
 
-        print("=" * 60)
-        print("Phase 5: Deep Supervision Training (Logic Engine)")
-        print("=" * 60)
-        print(f"  Learning rate:  {cfg.learning_rate}")
-        print(f"  Batch size:     {cfg.batch_size}")
-        print(f"  M_max (ACT):    {cfg.M_max}")
-        print(f"  Seq len:        {ARC_SEQ_LEN}")
+        if self.local_rank == 0:
+            print("=" * 60)
+            print("Autoregressive FineWeb Training (Combined Model) - Custom Multi-GPU")
+            print("=" * 60)
+        
+        # Add tokenizer setup to initialize router token
+        self.model.setup_tokenizer(tokenizer)
 
-        # ── Dataset / DataLoader ───────────────────────────────────────────
-        dataset = ARCDataset(
+        # --- INITIAL WEIGHT SYNC ---
+        # Ensure all GPUs start with the exact same initialized weights. 
+        if self.is_ddp:
+            with torch.no_grad():
+                for p in self.trainable_params:
+                    dist.broadcast(p.data, src=0)
+
+        raw_model = self.model
+
+        if self.local_rank == 0:
+            print("Downloading/Loading FineWeb dataset...")
+
+        dataset = FineWebDataset(
             data_dir=cfg.logic_dataset_path,
-            split   ="train",
+            tokenizer=tokenizer,
+            seq_len=cfg.seq_len,
             max_examples=cfg.num_examples,
         )
+        
+        if self.local_rank == 0:
+            print(f"  Loaded {len(dataset)} Causal LM examples from FineWeb")
+
+        # ── Distributed Sampler ────────────────────────────────────────────
+        sampler = DistributedSampler(dataset) if self.is_ddp else None
         loader = DataLoader(
             dataset,
             batch_size =cfg.batch_size,
-            shuffle    =True,
+            shuffle    =(sampler is None),
+            sampler    =sampler,
             num_workers=2,
             pin_memory =True,
             drop_last  =True,
         )
 
-        hrm = self.model.hrm_inner
-
-        try:
-            from tqdm import tqdm
-            total = cfg.num_epochs * len(loader)
-            progress = tqdm(total=total, desc="HRM Training")
-        except ImportError:
+        if self.local_rank == 0:
+            try:
+                from tqdm import tqdm
+                total = cfg.num_epochs * len(loader)
+                progress = tqdm(total=total, desc="Autoregressive Training")
+            except ImportError:
+                progress = None
+        else:
             progress = None
 
-        self.model.train()
+        raw_model.train()
 
         for epoch in range(cfg.num_epochs):
+            if self.is_ddp:
+                sampler.set_epoch(epoch)
+
             for batch in loader:
-                inp_seq = batch["inputs"].to(self.device)   # [B, 900]
-                labels  = batch["labels"].to(self.device)   # [B, 900]
+                self.optimizer.zero_grad()
+                
+                inp_seq = batch["inputs"].to(self.device)   # [B, Seq_Len]
+                labels  = batch["labels"].to(self.device)   # [B, Seq_Len]
 
-                # ── Deep supervision: M segments, each with its own backward ─
-                z_H = z_L = None
-                last_result = None
+                # Full forward pass through ValkyrieHRM natively
+                outputs = raw_model(input_ids=inp_seq, labels=labels)
+                loss = outputs.loss
 
-                for seg in range(cfg.M_max):
-                    self.optimizer.zero_grad()
+                # --- 1. LOSS NAN GUARD ---
+                is_loss_nan = torch.tensor(float(loss.isnan().any()), device=self.device)
+                if self.is_ddp:
+                    dist.all_reduce(is_loss_nan, op=dist.ReduceOp.MAX)
+                
+                if is_loss_nan.item() > 0:
+                    if self.local_rank == 0:
+                        print(f"\n  [NaN guard] step={self.global_step}: NaN loss detected in forward pass, skipping batch.")
+                    self.optimizer.zero_grad() 
+                    continue
 
-                    result = self._segment_step(hrm, inp_seq, labels, z_H, z_L)
-                    result["loss"].backward()
+                # Native Backward Pass (No Hooks to crash)
+                if loss.requires_grad:
+                    loss.backward()
+                
+                # --- 2. GRADIENT SANITIZATION & MANUAL DDP SYNC ---
+                if self.is_ddp:
+                    world_size = dist.get_world_size()
+                    
+                for p in self.trainable_params:
+                    # 1. Handle completely skipped paths
+                    if p.grad is None:
+                        if self.is_ddp:
+                            p.grad = torch.zeros_like(p.data)
+                        else:
+                            continue
+                            
+                    # 2. SANITIZE: Safely clamp Inf/NaN from float16 overflow to finite bounds
+                    p.grad.data.nan_to_num_()
+                    
+                    # 3. Safe FP32 Reduction (Prevents float16 overflow when summing across GPUs)
+                    if self.is_ddp:
+                        grad_fp32 = p.grad.data.to(torch.float32)
+                        dist.all_reduce(grad_fp32, op=dist.ReduceOp.SUM)
+                        p.grad.data.copy_(grad_fp32 / world_size)
 
-                    # ── NaN guard: skip optimizer step on NaN loss ─────────────
-                    # NaN in the loss or gradients means the states are already
-                    # corrupted; applying the optimizer step would make it worse.
-                    # Detach and move on — the next batch will recover.
-                    if result["loss"].isnan().any():
-                        print(f"  [NaN guard] step={self.global_step} seg={seg}: "
-                              f"NaN loss detected, skipping optimizer step.")
-                        self.optimizer.zero_grad()  # clear poisoned grads
-                        z_H = z_L = None            # reset carry for next batch
-                        break
+                # Now the gradients are guaranteed finite and synced. Safe to clip and step.
+                nn.utils.clip_grad_norm_(self.trainable_params, 1.0)
 
-                    nn.utils.clip_grad_norm_(self.model.get_hrm_parameters(), 1.0)
+                lr = self._update_lr()
+                self.optimizer.step()
+                self.global_step += 1
 
-                    lr = self._update_lr()
-                    self.optimizer.step()
+                if self.local_rank == 0:
+                    if progress:
+                        progress.update(1)
+                        progress.set_postfix_str(
+                            f"loss={outputs.loss.item():.4f} "
+                            f"lr={lr:.2e} "
+                            f"hrm_routed={outputs.route_mask.sum().item() if outputs.route_mask is not None else 0}"
+                        )
 
-                    z_H = result["z_H"]
-                    z_L = result["z_L"]
-                    last_result = result
-                    self.global_step += 1
+                    # Periodic checkpoint
+                    if self.global_step % cfg.save_steps == 0:
+                        self._save_checkpoint(raw_model)
 
-                    # Early halting via ACT
-                    if seg >= cfg.M_min - 1:
-                        with torch.no_grad():
-                            if (result["q_halt"] > result["q_continue"]).all():
-                                break
+        if self.local_rank == 0:
+            if progress:
+                progress.close()
+            self._save_checkpoint(raw_model, final=True)
+            print("\nAutoregressive training complete!")
 
-                if progress and last_result:
-                    progress.update(1)
-                    progress.set_postfix_str(
-                        f"loss={last_result['lm_loss']:.4f} "
-                        f"acc={last_result['exact_accuracy']:.2%} "
-                        f"lr={lr:.2e}"
-                    )
-
-                # Periodic checkpoint
-                if self.global_step % cfg.save_steps == 0:
-                    self._save_checkpoint()
-
-        if progress:
-            progress.close()
-        self._save_checkpoint(final=True)
-        print("\nDeep supervision training complete!")
-
-    def _save_checkpoint(self, final: bool = False):
+    def _save_checkpoint(self, raw_model, final: bool = False):
+        if self.local_rank != 0: 
+            return # Only rank 0 saves the model
+            
         cfg = self.hrm_config
         os.makedirs(cfg.output_dir, exist_ok=True)
         suffix = "final" if final else f"step_{self.global_step}"
         path   = os.path.join(cfg.output_dir, f"hrm_{suffix}.pt")
         torch.save({
-            "model_state_dict":     self.model.state_dict(),
+            "model_state_dict":     raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "global_step":          self.global_step,
         }, path)
@@ -437,22 +324,45 @@ class HRMTrainer:
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="HRM deep supervision training (paper-accurate)")
-    parser.add_argument("--model-checkpoint", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Autoregressive FineWeb training (Combined Model)")
+    parser.add_argument("--model-checkpoint", type=str, required=False, default="")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
+    # 1. Initialize DDP
+    is_ddp = int(os.environ.get("RANK", -1)) != -1
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+    else:
+        local_rank = 0
+        device = args.device
+
     config = get_config()
 
-    model = ValkyrieHRM(config).to(args.device)
-    if os.path.exists(args.model_checkpoint):
-        ckpt = torch.load(args.model_checkpoint, map_location=args.device)
+    # 2. Initialize the Tokenizer from the teacher model
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.teacher.model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 3. Initialize the Model
+    model = ValkyrieHRM(config).to(device)
+    if args.model_checkpoint and os.path.exists(args.model_checkpoint):
+        ckpt = torch.load(args.model_checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        print(f"Loaded checkpoint: {args.model_checkpoint}")
+        if local_rank == 0:
+            print(f"Loaded checkpoint: {args.model_checkpoint}")
 
-    trainer = HRMTrainer(config, model, device=args.device)
-    trainer.train()
+    # 4. Initialize Trainer and pass the DDP variables
+    trainer = HRMTrainer(config, model, device=device, is_ddp=is_ddp, local_rank=local_rank)
+    trainer.train(tokenizer=tokenizer)
 
+    # 5. Cleanup
+    if is_ddp:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

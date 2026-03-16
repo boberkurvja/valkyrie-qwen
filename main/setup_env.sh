@@ -12,12 +12,10 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 # 2. Install causal-conv1d from source (must be before mamba-ssm)
 echo "[2/6] Installing causal-conv1d from source..."
-pip install causal-conv1d>=1.4.0
+
 
 # 3. Install mamba-ssm from local source
 echo "[3/6] Installing mamba-ssm from source..."
-cd /root/model/mamba
-pip install -e .
 cd /root/model/main
 
 # 4. Install core ML dependencies
