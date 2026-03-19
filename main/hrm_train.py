@@ -14,7 +14,7 @@ import sys
 import math
 import argparse
 from typing import Optional, Dict
-
+import torch._dynamo
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,17 +39,17 @@ from models.losses import stablemax_cross_entropy, IGNORE_LABEL_ID
 from models.layers import CastedLinear, CastedEmbedding
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FineWeb Autoregressive Dataset
+#  Curated Autoregressive Dataset (Local Disk)
 # ─────────────────────────────────────────────────────────────────────────────
 import json, random
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from routing import REASON_TOKEN
 
-class FineWebDataset(Dataset):
+class CuratedReasoningDataset(Dataset):
     """
-    Loads general text data (e.g., FineWeb) and formats it for causal language modeling.
-    Periodically injects the <|reason|> token to activate the HRM coprocessor.
+    Loads a curated reasoning dataset from local disk where the <|reason|>
+    token has already been inserted perfectly before logical conclusions.
     """
     def __init__(self, data_dir: str, tokenizer: AutoTokenizer, seq_len: int = 2048, max_examples: Optional[int] = None):
         self.examples = []
@@ -64,9 +64,9 @@ class FineWebDataset(Dataset):
         self._load(data_dir, max_examples)
 
     def _load(self, data_dir: str, max_examples: Optional[int]):
-        from datasets import load_dataset
+        from datasets import load_from_disk
         
-        dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+        dataset = load_from_disk(data_dir)
         
         for i, row in enumerate(dataset):
             if max_examples and len(self.examples) >= max_examples:
@@ -74,17 +74,8 @@ class FineWebDataset(Dataset):
                 
             text = row["text"]
             
-            # Tokenize text
+            # Tokenize text (The <|reason|> tokens are already in the string)
             tokens = self.tokenizer(text, truncation=True, max_length=self.seq_len, return_tensors="pt")["input_ids"].squeeze(0)
-            
-            # Inject <|reason|> token randomly to train the router/HRM path
-            if len(tokens) > 10 and random.random() > 0.5:
-                insert_idx = random.randint(5, len(tokens) - 5)
-                tokens = torch.cat([
-                    tokens[:insert_idx], 
-                    torch.tensor([self.reason_token_id]), 
-                    tokens[insert_idx:]
-                ])[:self.seq_len]
 
             # Pad sequence if necessary
             if len(tokens) < self.seq_len:
@@ -122,10 +113,36 @@ class HRMTrainer:
         # 1. Freeze everything by default
         self.model.freeze_backbone()
 
-        # 2. Extract strictly necessary parameters using Python id() to prevent PyTorch broadcasting crashes
-        self.trainable_params = []
+        # =====================================================================
+        # ULTIMATE NUMERIC STABILITY PATCH (FP16 OVERFLOW FIX)
+        # =====================================================================
+        self.model.bridge.to(torch.float32)
+        self.model.hrm_inner.to(torch.float32)
+        self.model.stablemax_head.to(torch.float32)
+
+        # Patch HRM Forward to upcast inputs and downcast outputs
+        # Patch HRM Forward to upcast inputs and downcast outputs
+        orig_hrm_forward = self.model._hrm_forward
+        def safe_hrm_forward(hidden_states):
+            orig_dtype = hidden_states.dtype
+            out_fp32 = orig_hrm_forward(hidden_states.to(torch.float32))
+            return out_fp32.to(orig_dtype)
+            
+        self.model._hrm_forward = safe_hrm_forward
         
-        # Get the memory IDs of the parameters designated for training (Bridge + HRM)
+        # Re-enable torch.compile on the safe FP32 wrapper
+        torch._dynamo.config.suppress_errors = True
+        self.model._compiled_hrm_forward = torch.compile(safe_hrm_forward, mode="default")
+
+        # Patch StableMax Forward to upcast inputs
+        orig_stablemax = self.model.stablemax_head.forward
+        def safe_stablemax(hidden_states):
+            return orig_stablemax(hidden_states.to(torch.float32))
+        self.model.stablemax_head.forward = safe_stablemax
+        # =====================================================================
+
+        # 2. Extract strictly necessary parameters using Python id()
+        self.trainable_params = []
         hrm_param_ids = {id(p) for p in self.model.get_hrm_parameters()}
 
         for name, p in self.model.named_parameters():
@@ -178,14 +195,12 @@ class HRMTrainer:
 
         if self.local_rank == 0:
             print("=" * 60)
-            print("Autoregressive FineWeb Training (Combined Model) - Custom Multi-GPU")
+            print("Autoregressive Curated Training (Combined Model) - Stable FP32")
             print("=" * 60)
         
-        # Add tokenizer setup to initialize router token
         self.model.setup_tokenizer(tokenizer)
 
         # --- INITIAL WEIGHT SYNC ---
-        # Ensure all GPUs start with the exact same initialized weights. 
         if self.is_ddp:
             with torch.no_grad():
                 for p in self.trainable_params:
@@ -194,17 +209,18 @@ class HRMTrainer:
         raw_model = self.model
 
         if self.local_rank == 0:
-            print("Downloading/Loading FineWeb dataset...")
+            print("Loading Curated Valkyrie dataset from local disk...")
 
-        dataset = FineWebDataset(
-            data_dir=cfg.logic_dataset_path,
+        # Pointing to your local dataset path
+        dataset = CuratedReasoningDataset(
+            data_dir="/root/valkyrie_reasoning_data",
             tokenizer=tokenizer,
             seq_len=cfg.seq_len,
             max_examples=cfg.num_examples,
         )
         
         if self.local_rank == 0:
-            print(f"  Loaded {len(dataset)} Causal LM examples from FineWeb")
+            print(f"  Loaded {len(dataset)} Causal LM examples from disk")
 
         # ── Distributed Sampler ────────────────────────────────────────────
         sampler = DistributedSampler(dataset) if self.is_ddp else None
@@ -251,7 +267,11 @@ class HRMTrainer:
                 
                 if is_loss_nan.item() > 0:
                     if self.local_rank == 0:
-                        print(f"\n  [NaN guard] step={self.global_step}: NaN loss detected in forward pass, skipping batch.")
+                        msg = f"[Step {self.global_step}] ⚠️ NaN loss detected in forward pass. Skipping batch."
+                        if progress:
+                            progress.write(msg)
+                        else:
+                            print(msg)
                     self.optimizer.zero_grad() 
                     continue
 
@@ -262,7 +282,8 @@ class HRMTrainer:
                 # --- 2. GRADIENT SANITIZATION & MANUAL DDP SYNC ---
                 if self.is_ddp:
                     world_size = dist.get_world_size()
-                    
+                
+                local_nan_count = 0    
                 for p in self.trainable_params:
                     # 1. Handle completely skipped paths
                     if p.grad is None:
@@ -271,32 +292,56 @@ class HRMTrainer:
                         else:
                             continue
                             
-                    # 2. SANITIZE: Safely clamp Inf/NaN from float16 overflow to finite bounds
+                    # Track pre-sanitization NaNs locally for telemetry
+                    if not p.grad.isfinite().all():
+                        local_nan_count += 1
+                            
+                    # 2. SANITIZE: Safely clamp Inf/NaN
                     p.grad.data.nan_to_num_()
                     
-                    # 3. Safe FP32 Reduction (Prevents float16 overflow when summing across GPUs)
+                    # 3. Safe FP32 Reduction
                     if self.is_ddp:
                         grad_fp32 = p.grad.data.to(torch.float32)
                         dist.all_reduce(grad_fp32, op=dist.ReduceOp.SUM)
                         p.grad.data.copy_(grad_fp32 / world_size)
 
-                # Now the gradients are guaranteed finite and synced. Safe to clip and step.
-                nn.utils.clip_grad_norm_(self.trainable_params, 1.0)
+                # Collect the maximum absolute gradient value across all parameters (post-sync)
+                max_grad_val = 0.0
+                for p in self.trainable_params:
+                    if p.grad is not None:
+                        curr_max = p.grad.data.abs().max().item()
+                        if curr_max > max_grad_val:
+                            max_grad_val = curr_max
+
+                # clip_grad_norm_ returns the total L2 norm BEFORE clipping is applied.
+                pre_clip_norm = nn.utils.clip_grad_norm_(self.trainable_params, 1.0)
+                if isinstance(pre_clip_norm, torch.Tensor):
+                    pre_clip_norm = pre_clip_norm.item()
 
                 lr = self._update_lr()
                 self.optimizer.step()
                 self.global_step += 1
 
+                # --- 3. DETAILED PER-STEP TELEMETRY LOGGING ---
                 if self.local_rank == 0:
+                    routed_count = outputs.route_mask.sum().item() if outputs.route_mask is not None else 0
+                    
+                    log_str = (
+                        f"[Step {self.global_step:04d}] "
+                        f"Loss: {loss.item():.4f} | "
+                        f"Pre-Clip Norm: {pre_clip_norm:8.2f} | "
+                        f"Max Grad: {max_grad_val:8.2f} | "
+                        f"NaN Tensors: {local_nan_count:2d} | "
+                        f"Routed: {routed_count}"
+                    )
+                    
                     if progress:
+                        progress.write(log_str)
                         progress.update(1)
-                        progress.set_postfix_str(
-                            f"loss={outputs.loss.item():.4f} "
-                            f"lr={lr:.2e} "
-                            f"hrm_routed={outputs.route_mask.sum().item() if outputs.route_mask is not None else 0}"
-                        )
+                        progress.set_postfix_str(f"loss={loss.item():.4f} lr={lr:.2e}")
+                    else:
+                        print(log_str)
 
-                    # Periodic checkpoint
                     if self.global_step % cfg.save_steps == 0:
                         self._save_checkpoint(raw_model)
 
@@ -308,7 +353,7 @@ class HRMTrainer:
 
     def _save_checkpoint(self, raw_model, final: bool = False):
         if self.local_rank != 0: 
-            return # Only rank 0 saves the model
+            return 
             
         cfg = self.hrm_config
         os.makedirs(cfg.output_dir, exist_ok=True)
@@ -324,12 +369,12 @@ class HRMTrainer:
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Autoregressive FineWeb training (Combined Model)")
+    torch.backends.cudnn.benchmark = True
+    parser = argparse.ArgumentParser(description="Autoregressive Curated training (Combined Model)")
     parser.add_argument("--model-checkpoint", type=str, required=False, default="")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    # 1. Initialize DDP
     is_ddp = int(os.environ.get("RANK", -1)) != -1
     if is_ddp:
         dist.init_process_group(backend="nccl")
@@ -342,13 +387,11 @@ def main():
 
     config = get_config()
 
-    # 2. Initialize the Tokenizer from the teacher model
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.teacher.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 3. Initialize the Model
     model = ValkyrieHRM(config).to(device)
     if args.model_checkpoint and os.path.exists(args.model_checkpoint):
         ckpt = torch.load(args.model_checkpoint, map_location=device)
@@ -356,11 +399,9 @@ def main():
         if local_rank == 0:
             print(f"Loaded checkpoint: {args.model_checkpoint}")
 
-    # 4. Initialize Trainer and pass the DDP variables
     trainer = HRMTrainer(config, model, device=device, is_ddp=is_ddp, local_rank=local_rank)
     trainer.train(tokenizer=tokenizer)
 
-    # 5. Cleanup
     if is_ddp:
         dist.destroy_process_group()
 

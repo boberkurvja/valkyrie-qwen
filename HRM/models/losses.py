@@ -20,7 +20,7 @@ def log_stablemax(x, dim=-1):
     # Numerically stable version: compute log(s(x)) directly to avoid log(0).
     # s(x) = 1/(1-x) for x<0  →  log(s(x)) = -log1p(-x)
     # s(x) = (1+x)   for x>=0 →  log(s(x)) =  log1p(x)
-    log_s_x = torch.where(x < 0, -torch.log1p(-x), torch.log1p(x))
+    log_s_x = torch.sign(x) * torch.log1p(torch.abs(x))
     # Use logsumexp for the denominator (stable, avoids materializing s_x/sum)
     log_sum = torch.logsumexp(log_s_x, dim=dim, keepdim=True)
     return log_s_x - log_sum
