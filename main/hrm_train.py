@@ -121,7 +121,6 @@ class HRMTrainer:
         self.model.stablemax_head.to(torch.float32)
 
         # Patch HRM Forward to upcast inputs and downcast outputs
-        # Patch HRM Forward to upcast inputs and downcast outputs
         orig_hrm_forward = self.model._hrm_forward
         def safe_hrm_forward(hidden_states):
             orig_dtype = hidden_states.dtype
@@ -251,6 +250,14 @@ class HRMTrainer:
                 sampler.set_epoch(epoch)
 
             for batch in loader:
+                # --- EXPLICIT STEP CAP ---
+                if hasattr(cfg, 'max_steps') and self.global_step >= cfg.max_steps:
+                    if self.local_rank == 0:
+                        msg = f"\n[Step {self.global_step}] Reached max_steps ({cfg.max_steps}). Halting to prevent late-stage overfitting."
+                        if progress: progress.write(msg)
+                        else: print(msg)
+                    break 
+
                 self.optimizer.zero_grad()
                 
                 inp_seq = batch["inputs"].to(self.device)   # [B, Seq_Len]
@@ -345,6 +352,10 @@ class HRMTrainer:
                     if self.global_step % cfg.save_steps == 0:
                         self._save_checkpoint(raw_model)
 
+            # Break the outer loop if max_steps was triggered
+            if hasattr(cfg, 'max_steps') and self.global_step >= cfg.max_steps:
+                break
+
         if self.local_rank == 0:
             if progress:
                 progress.close()
@@ -393,13 +404,24 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = ValkyrieHRM(config).to(device)
+    
+    ckpt = None
     if args.model_checkpoint and os.path.exists(args.model_checkpoint):
         ckpt = torch.load(args.model_checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         if local_rank == 0:
-            print(f"Loaded checkpoint: {args.model_checkpoint}")
+            print(f"Loaded checkpoint weights: {args.model_checkpoint}")
 
     trainer = HRMTrainer(config, model, device=device, is_ddp=is_ddp, local_rank=local_rank)
+    
+    # --- ADD THIS BLOCK TO FULLY RESUME TRAINING STATE ---
+    if ckpt is not None and "optimizer_state_dict" in ckpt:
+        trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        trainer.global_step = ckpt.get("global_step", 0)
+        if local_rank == 0:
+            print(f"Resumed optimizer state and global step ({trainer.global_step})")
+    # -----------------------------------------------------
+
     trainer.train(tokenizer=tokenizer)
 
     if is_ddp:

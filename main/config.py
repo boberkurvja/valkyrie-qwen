@@ -73,7 +73,7 @@ class HRMTrainConfig:
     batch_size: int = 2
     learning_rate: float = 3e-5
     warmup_steps: int = 500
-    num_epochs: int = 100
+    num_epochs: int = 50
     # ACT config
     M_max: int = 16
     M_min: int = 2
@@ -82,7 +82,7 @@ class HRMTrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     # Checkpointing
-    save_steps: int = 500
+    save_steps: int = 5000
     eval_steps: int = 100
     output_dir: str = "checkpoints/hrm_train"
 
