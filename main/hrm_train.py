@@ -201,7 +201,13 @@ class CuratedReasoningDataset(Dataset):
 
             # For Causal LM, labels are exactly the input_ids. 
             labels = tokens.clone()
-            labels[labels == self.tokenizer.pad_token_id] = -100 # Ignore padding in loss
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            # --- 1. PROMPT MASKING (Valkyrie MoS Stability) ---
+            # Mask all tokens before <|reason|> to focus HRM on reasoning logic only.
+            reason_indices = (tokens == self.reason_token_id).nonzero(as_tuple=True)[0]
+            if len(reason_indices) > 0:
+                labels[:reason_indices[0] + 1] = -100
 
             self.examples.append({
                 "inputs": tokens.to(torch.long),
@@ -276,7 +282,8 @@ class HRMTrainer:
         for name, p in self.model.named_parameters():
             if id(p) in hrm_param_ids:
                 # Filter out the unused giant token layers
-                if "hrm_inner.lm_head" in name or "hrm_inner.embed_tokens" in name:
+                # UNFREEZE hrm_inner.lm_head to allow trainable influence on vocabulary
+                if "hrm_inner.embed_tokens" in name:
                     p.requires_grad_(False)
                 else:
                     p.requires_grad_(True)
@@ -431,12 +438,22 @@ class HRMTrainer:
                     if halted.all():
                         break
 
+                    pr_h, pr_l = 0.0, 0.0
+
                     self.optimizer.zero_grad()
 
                     # Full forward pass through ValkyrieHRM natively
                     outputs = raw_model(input_ids=inp_seq, labels=labels, hrm_carry=hrm_carry)
-                    loss = outputs.loss
+                    # Extract native Cross-Entropy loss from the forward pass
+                    base_ce_loss = outputs.loss
                     
+                    # 1. TIME-DISCOUNTED CURRICULUM LOSS (Quadratic Penalty)
+                    # We penalize early "fast" thoughts less than final "deliberative" results.
+                    segment_weight = (segment / curr_M_max) ** 2
+                    discounted_loss = base_ce_loss * segment_weight
+                    
+                    loss = discounted_loss
+
                     # Compute Q-learning targets & loss
                     if outputs.q_logits is not None:
                         q_halt_logits = outputs.q_logits[..., 0]
@@ -466,26 +483,55 @@ class HRMTrainer:
                             
                         loss = loss + q_loss
 
-                    # --- 1. RANK DIVERSITY LOSS (Prevent Dimensional Collapse) ---
-                    # We encourage PR_H > PR_L as per Section 4 (Page 13)
+                    # --- 1. RANK DIVERSITY & DECORRELATION LOSS (Prevent Neural Collapse) ---
                     rank_loss = torch.tensor(0.0, device=self.device)
                     if getattr(outputs, "hrm_states", None) is not None:
                         z_H, z_L = outputs.hrm_states
-                        def get_pr_val(x):
-                            x_flat = x.view(-1, x.shape[-1])
+                        
+                        def calc_pr_and_decorr(x, target_pr):
+                            # Flatten batch and sequence dims
+                            x_flat = x.view(-1, x.shape[-1]).float()
+                            
+                            # 1. Variance Loss (Hinge loss to ensure variance is at least 1.0 per dimension)
+                            # This prevents the representation from shrinking to zero.
+                            std = torch.sqrt(x_flat.var(dim=0) + 1e-4)
+                            var_loss = torch.mean(F.relu(1.0 - std))
+                            
+                            # Mean center for Covariance
                             x_centered = x_flat - x_flat.mean(dim=0)
+                            
+                            # Covariance matrix
                             cov = torch.mm(x_centered.T, x_centered) / max(1, x_centered.shape[0] - 1)
+                            
+                            # 2. Decorrelation Loss (Minimize off-diagonal elements)
+                            # This forces the features to become orthogonal, expanding the rank.
+                            off_diag = cov - torch.diag(torch.diag(cov))
+                            decorr_loss = (off_diag ** 2).mean()
+                            
+                            # 3. Participation Ratio (for telemetry only, or light gradients)
                             tr_cov = torch.trace(cov)
                             tr_cov_sq = torch.trace(torch.mm(cov, cov))
-                            return (tr_cov**2) / (tr_cov_sq + 1e-8)
+                            pr_val = (tr_cov**2) / (tr_cov_sq.detach() + 1e-6)
+                            
+                            # Combine losses: Heavily penalize low variance and high correlation
+                            collapse_loss = var_loss + (10.0 * decorr_loss)
+                            
+                            # Add the target PR hinge
+                            pr_loss = F.relu(target_pr - pr_val)
+                            
+                            return pr_val.item(), collapse_loss + pr_loss
+
+                        # We target PR_H ~ 90 and PR_L ~ 30
+                        pr_h_val, collapse_loss_h = calc_pr_and_decorr(z_H, 90.0)
+                        pr_l_val, collapse_loss_l = calc_pr_and_decorr(z_L, 30.0)
                         
-                        pr_h_val = get_pr_val(z_H)
-                        pr_l_val = get_pr_val(z_L)
-                        
-                        # Penalty if PR_H < PR_L or PR_H < 5.0
-                        # This "pushes" the reasoning space to be wider than the execution space
-                        rank_loss = 0.05 * (F.relu(pr_l_val - pr_h_val + 1.0) + F.relu(5.0 - pr_h_val))
+                        # Scale this up slightly now that the base CE loss is stable
+                        rank_loss = 0.05 * (collapse_loss_h + collapse_loss_l)
                         loss = loss + rank_loss
+                        
+                        # Update local telemetry variables for logging
+                        pr_h = pr_h_val
+                        pr_l = pr_l_val
 
                     # --- 1. LOSS NAN GUARD ---
                     is_loss_nan = torch.tensor(float(loss.isnan().any()), device=self.device)
@@ -549,10 +595,15 @@ class HRMTrainer:
                     self.optimizer.step()
                     self.global_step += 1
                     
-                    # Detach carry for Next Segment (Deep Supervision)
+                    # --- DETACH FOR 1-STEP GRADIENT (Section 2.1) ---
+                    # We MUST detach everything to prevent computation graph accumulation
                     if getattr(outputs, "new_carry", None) is not None:
-                        z_H, z_L = outputs.new_carry
-                        hrm_carry = (z_H.detach(), z_L.detach())
+                        new_carry = outputs.new_carry
+                        if isinstance(new_carry, tuple):
+                            new_carry = tuple(c.detach() for c in new_carry)
+                        elif isinstance(new_carry, torch.Tensor):
+                            new_carry = new_carry.detach()
+                        hrm_carry = new_carry
                         
                     # Halting Logic
                     with torch.no_grad():
@@ -578,20 +629,10 @@ class HRMTrainer:
                             else:
                                 acc = 0.0
 
-                            pr_h, pr_l = 0.0, 0.0
-                            if getattr(outputs, "hrm_states", None) is not None:
-                                z_H, z_L = outputs.hrm_states
-                                
-                                def calc_pr(x):
-                                    x_flat = x.view(-1, x.shape[-1]).float()
-                                    x_flat = x_flat - x_flat.mean(dim=0)
-                                    cov = torch.mm(x_flat.T, x_flat) / max(1, x_flat.shape[0] - 1)
-                                    tr_cov = torch.trace(cov)
-                                    tr_cov_sq = torch.trace(torch.mm(cov, cov))
-                                    return (tr_cov**2 / tr_cov_sq).item() if tr_cov_sq > 1e-8 else 0.0
+                            # Using precision PR values from the rank_loss calculation above
+                            pass
                                     
-                                pr_h = calc_pr(z_H)
-                                pr_l = calc_pr(z_L)
+                            # Telemetry strings will use pr_h and pr_l variables
 
                         routed_count = outputs.route_mask.sum().item() if outputs.route_mask is not None else 0
                         avg_act_segments = seq_steps.mean().item()

@@ -6,7 +6,7 @@ and routing mechanism into a unified model.
 import sys
 from typing import Optional, Dict, Tuple, List
 from dataclasses import dataclass, field
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,6 +87,11 @@ class ValkyrieHRM(nn.Module):
             hidden_size=config.teacher.hidden_size,
             vocab_size=config.teacher.vocab_size,
         )
+
+        # --- 3. MoS LEARNER GATE (Stabilization) ---
+        # Initialize near zero (gate=0.5 approx if sigmoid(0)).
+        # Actually initializing to -4.0 (sigmoid ≈ 0.018) follows the user's "init near zero" intent.
+        self.mos_gate = nn.Parameter(torch.full((1,), -4.0))
 
         # Compile HRM forward for kernel fusion (reduces Python dispatch overhead)
         self._compiled_hrm_forward = torch.compile(
@@ -222,14 +227,30 @@ class ValkyrieHRM(nn.Module):
         # Project back to Valkyrie space: [B, L, H_valkyrie]
         output = self.bridge.from_hrm_space(z_H)
         
-        # New carry holds the complete temporal sequence state
+        # --- STRICT RECURRENT NORMALIZATION (DEQ Stability) ---
+        # Force the state to remain on the hypersphere, preventing magnitude explosion.
+        # This ensures the mapping stays contractive as per Deep Equilibrium theory.
+        d_model = self.bridge_config.hrm_hidden_size
+        z_H = F.normalize(z_H, p=2, dim=-1) * math.sqrt(d_model)
+        z_L = F.normalize(z_L, p=2, dim=-1) * math.sqrt(d_model)
+
+        # --- 3. MoS GATING INTEGRATION ---
+        # Gating prevents "logit screaming" by allowing the HRM to dial up its influence.
+        # Initial gate is near zero, allowing the Bridge to stabilize first.
+        gate = torch.sigmoid(self.mos_gate)
+        
+        # Specialist result: base_hidden + gate * hrm_delta
+        # This is equivalent to: base * (1-gate) + (base+delta) * gate
+        res = hidden_states + gate * output
+
+        # New carry holds the complete temporal sequence state (stabilized)
         new_carry = (z_H, z_L)
 
         # Q-learning Head as shown in the original code, using first token
         q_logits = self.hrm_inner.q_head(z_H[:, 0]).to(torch.float32)
 
         # Residual connection: add original hidden states
-        return hidden_states + output, new_carry, float(H_cycles * L_cycles), (z_H, z_L), q_logits
+        return res, new_carry, float(H_cycles * L_cycles), (z_H, z_L), q_logits
 
     def forward(
         self,
@@ -331,9 +352,10 @@ class ValkyrieHRM(nn.Module):
         )
 
     def get_hrm_parameters(self) -> List[nn.Parameter]:
-        """Get HRM + bridge parameters for Phase 5 training."""
+        """Get HRM + bridge + gating parameters for Phase 5 training."""
         params = list(self.bridge.get_bridge_parameters())
         params.extend(self.hrm_inner.parameters())
+        params.append(self.mos_gate)
         return params
 
     def get_s5_parameters(self) -> List[nn.Parameter]:
